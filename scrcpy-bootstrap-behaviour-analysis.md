@@ -8,7 +8,7 @@ scrcpy 是一款可以把安卓手机的屏幕投到电脑上，并支持在电�
 
 **注意，在读源码之前，建议先按照scrcpy的文档配置好编译环境并且自己动手编译一次scrcpy的client和server。这样有助于配置IDE的代码高亮功能。**
 
-**注意，本文的源码阅读环境为macOS 10.15，并不会去分析不属于本平台的代码段。**
+**注意，本文的源码阅读环境为macOS 10.15，并不会去分析不属于本平台的代码段。**阅读的代码分支及版本为:[master 5086e7b](https://github.com/Genymobile/scrcpy/commit/5086e7b744e9edfa9d1d56cf5ae2ad3b0ae32ddf)。
 
 ### 0. 解析启动参数
 
@@ -309,7 +309,115 @@ socket初始化完成之后，需要把socket绑定到 一个具体的地址上�
 
 从`listen_on_port()`方法返回之后的代码段就只是一些socket创建失败的打日志，以及端口重试工作了。没有太大的特别。只要port range中的其中一个端口能正确启动adb reverse and create a socket and begin listening client's connection (network layer)，那么`enable_tunnel_any_port`的任务就完成了。
 
-通过上面的源码阅读我们知道，scrcpy的client是可以接受用户传入一组端口来协商启动的，因此在没有真正创建出socket之前，程序是不知道到底选择了哪个端口的；在端口选好、socket完成创建之后，需要让scrcpy server开始连接client刚刚创建出来的socket。而“告诉server有关socket的信息”，其中一个方法就是命令行启动的参数。是的，接下来scrcpy将再次执行adb命令，启动scrcpy-server。
+通过上面的源码阅读我们知道，scrcpy的client是可以接受用户传入一组端口来协商启动的，因此在没有真正创建出socket之前，程序是不知道到底选择了哪个端口的；在端口选好、socket完成创建之后，需要让scrcpy server开始连接client刚刚创建出来的socket。是的，接下来scrcpy将再次执行adb命令，启动scrcpy-server。
+
+```c
+static process_t
+execute_server(struct server *server, const struct server_params *params) {
+    char max_size_string[6];
+    char bit_rate_string[11];
+    char max_fps_string[6];
+    char lock_video_orientation_string[5];
+    char display_id_string[6];
+    sprintf(max_size_string, "%"PRIu16, params->max_size);
+    sprintf(bit_rate_string, "%"PRIu32, params->bit_rate);
+    sprintf(max_fps_string, "%"PRIu16, params->max_fps);
+    sprintf(lock_video_orientation_string, "%"PRIi8, params->lock_video_orientation);
+    sprintf(display_id_string, "%"PRIu16, params->display_id);
+    const char *const cmd[] = {
+        "shell",
+        "CLASSPATH=" DEVICE_SERVER_PATH,
+        "app_process",
+#ifdef SERVER_DEBUGGER
+# define SERVER_DEBUGGER_PORT "5005"
+# ifdef SERVER_DEBUGGER_METHOD_NEW
+        /* Android 9 and above */
+        "-XjdwpProvider:internal -XjdwpOptions:transport=dt_socket,suspend=y,server=y,address="
+# else
+        /* Android 8 and below */
+        "-agentlib:jdwp=transport=dt_socket,suspend=y,server=y,address="
+# endif
+            SERVER_DEBUGGER_PORT,
+#endif
+        "/", // unused
+        "com.genymobile.scrcpy.Server",
+        SCRCPY_VERSION,
+        log_level_to_server_string(params->log_level),
+        max_size_string,
+        bit_rate_string,
+        max_fps_string,
+        lock_video_orientation_string,
+        server->tunnel_forward ? "true" : "false",
+        params->crop ? params->crop : "-",
+        "true", // always send frame meta (packet boundaries + timestamp)
+        params->control ? "true" : "false",
+        display_id_string,
+        params->show_touches ? "true" : "false",
+        params->stay_awake ? "true" : "false",
+        params->codec_options ? params->codec_options : "-",
+    };
+#ifdef SERVER_DEBUGGER
+    LOGI("Server debugger waiting for a client on device port "
+         SERVER_DEBUGGER_PORT "...");
+    // From the computer, run
+    //     adb forward tcp:5005 tcp:5005
+    // Then, from Android Studio: Run > Debug > Edit configurations...
+    // On the left, click on '+', "Remote", with:
+    //     Host: localhost
+    //     Port: 5005
+    // Then click on "Debug"
+#endif
+    return adb_execute(server->serial, cmd, sizeof(cmd) / sizeof(cmd[0]));
+}
+```
+
+可能有读者读完这段代码后会感到困惑，诶，为什么它不把刚才选择的端口用启动参数的方式传给server啊？不然的话server怎么知道刚才创建socket的时候选择的到底是哪个端口啊？
+
+其实这个问题的答案非常简单，还记得上面的adb reverse命令吗？
+
+```shell
+adb reverse localabstract:scrcpy tcp:27183
+```
+
+这句命令会把刚才我们创建的本地socket命名为"scrcpy"。这个名字在client侧和server侧都是通的，因此server侧只要执行
+
+```java
+// ...before
+private static final String SOCKET_NAME = "scrcpy";
+// SOCKRT
+videoSocket = connect(SOCKET_NAME);
+try {
+     controlSocket = connect(SOCKET_NAME);
+} catch (IOException | RuntimeException e) {
+     videoSocket.close();
+     throw e;
+}
+// ...rest
+```
+
+就可以连接到client创建的socket了。其他的server启动命令就平淡无奇了，只是把client接收到的一些参数通过命令行参数的方式发给server而已。
+
+接下来，client 创建了一个守护线程，代码如下所示
+
+```c
+// If the server process dies before connecting to the server socket, then
+    // the client will be stuck forever on accept(). To avoid the problem, we
+    // must be able to wake up the accept() call when the server dies. To keep
+    // things simple and multiplatform, just spawn a new thread waiting for the
+    // server process and calling shutdown()/close() on the server socket if
+    // necessary to wake up any accept() blocking call.
+
+/*
+	当server进程在开始连接client的socket之前就死掉了的话，
+*/
+    server->wait_server_thread =
+        SDL_CreateThread(run_wait_server, "wait-server", server);
+    if (!server->wait_server_thread) {
+        cmd_terminate(server->process);
+        cmd_simple_wait(server->process, NULL); // ignore exit code
+        goto error2;
+    }
+```
 
 
 
