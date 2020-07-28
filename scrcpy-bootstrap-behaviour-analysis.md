@@ -842,9 +842,148 @@ recorder_push(struct recorder *recorder, const AVPacket *packet) {
 
 ```
 
+否则，对刚才的视频流数据包进行解析，分别推给decoder和recorder(如有)：
 
+```c
+static bool
+stream_parse(struct stream *stream, AVPacket *packet) {
+    uint8_t *in_data = packet->data;
+    int in_len = packet->size;
+    uint8_t *out_data = NULL;
+    int out_len = 0;
+    int r = av_parser_parse2(stream->parser, stream->codec_ctx,
+                             &out_data, &out_len, in_data, in_len,
+                             AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+
+    // PARSER_FLAG_COMPLETE_FRAMES is set
+    assert(r == in_len);
+    (void) r;
+    assert(out_len == in_len);
+
+    if (stream->parser->key_frame == 1) {
+        packet->flags |= AV_PKT_FLAG_KEY;
+    }
+
+    bool ok = process_frame(stream, packet);
+    if (!ok) {
+        LOGE("Could not process frame");
+        return false;
+    }
+
+    return true;
+}
+```
+
+关键在`process_frame`方法中。
+
+```c
+static bool
+process_frame(struct stream *stream, AVPacket *packet) {
+    if (stream->decoder && !decoder_push(stream->decoder, packet)) {
+        return false;
+    }
+
+    if (stream->recorder) {
+        packet->dts = packet->pts;
+
+        if (!recorder_push(stream->recorder, packet)) {
+            LOGE("Could not send packet to recorder");
+            return false;
+        }
+    }
+
+    return true;
+}
+```
+
+跟进`decoder_push`方法阅读代码：
+
+```c
+bool
+decoder_push(struct decoder *decoder, const AVPacket *packet) {
+// the new decoding/encoding API has been introduced by:
+// <http://git.videolan.org/?p=ffmpeg.git;a=commitdiff;h=7fc329e2dd6226dfecaa4a1d7adf353bf2773726>
+    int ret;
+    if ((ret = avcodec_send_packet(decoder->codec_ctx, packet)) < 0) {
+        LOGE("Could not send video packet: %d", ret);
+        return false;
+    }
+    ret = avcodec_receive_frame(decoder->codec_ctx,
+                                decoder->video_buffer->decoding_frame);
+    if (!ret) {
+        // a frame was received
+        push_frame(decoder);
+    } else if (ret != AVERROR(EAGAIN)) {
+        LOGE("Could not receive video frame: %d", ret);
+        return false;
+    }
+    return true;
+  // 上面的代码省略了没有新解码API时的Fallback方法。如果读者有兴趣可以自行在scrcpy源码中查看#else宏定义的fallback代码。
+}
+```
+
+这个`decoder_push`把数据包推给decoder, 等解码器对数据包进行解码后，从解码器的视频缓冲区中把帧拿出来，看看帧OK了没有。如果OK了，就会把帧数据给到decoder的video_buffer，然后通知SDL说有新的帧要绘制了。通知SDL的方法没什么意思，我们重点关注的是把帧提交到video_buffer的操作：
+
+```c
+void
+video_buffer_offer_decoded_frame(struct video_buffer *vb,
+                                 bool *previous_frame_skipped) {
+    mutex_lock(vb->mutex);
+    if (vb->render_expired_frames) {
+        // wait for the current (expired) frame to be consumed
+        while (!vb->rendering_frame_consumed && !vb->interrupted) {
+            cond_wait(vb->rendering_frame_consumed_cond, vb->mutex);
+        }
+    } else if (!vb->rendering_frame_consumed) {
+        fps_counter_add_skipped_frame(vb->fps_counter);
+    }
+
+    video_buffer_swap_frames(vb); // 标准的双缓冲！
+
+    *previous_frame_skipped = !vb->rendering_frame_consumed;
+    vb->rendering_frame_consumed = false;
+
+    mutex_unlock(vb->mutex);
+}
+```
+
+看上面代码段中的注释，结合上面拿到解码后的帧的代码
+
+```c
+avcodec_receive_frame(decoder->codec_ctx,
+                                decoder->video_buffer->decoding_frame);
+```
+
+不难知道这双缓冲到底是怎么做的：先把解码完的帧保存在“所谓的”decoding_frame结构中，然后对rendering_frame和decoding_frame做交换，最后通知SDL绘制新的帧。这样就避免了相同的帧在decoding和rendering中复制；
+
+```c
+static void
+video_buffer_swap_frames(struct video_buffer *vb) {
+    AVFrame *tmp = vb->decoding_frame;
+    vb->decoding_frame = vb->rendering_frame;
+    vb->rendering_frame = tmp;
+}
+```
+
+只要交换指针，就等于提交了新的帧去渲染，非常的make sense，节约资源。这就是典型的双缓冲，典型的Zero copy，CAS设计。
+
+下面有个if代码可以提醒一下：
+
+```c
+if (stream->has_pending) {
+		// the pending packet must be discarded (consumed or error)
+		stream->has_pending = false;
+		av_packet_unref(&stream->pending);
+}
+```
+
+其中因为`stream->has_pending`是在处理config包的时候被set上去的，如果走到了下面的逻辑（不是config包）的时候，`stream->has_pending`还是true的话，其实pending的帧已经被处理过了，直接设回false就可以了。
+
+最后就是简单的释放pending包资源。完成一帧的接收和渲染。
 
 ### 8. 控制器初始化
+
+至此，有关视频流的接收初始化工作就全部完成了。我们可以松口气，开始看看并不这么麻烦的控制器初始化以及控制数据包的格式。
 
 ### 9. 让SDL开始渲染画面
 
