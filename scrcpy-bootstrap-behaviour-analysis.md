@@ -983,7 +983,66 @@ if (stream->has_pending) {
 
 ### 8. 控制器初始化
 
-至此，有关视频流的接收初始化工作就全部完成了。我们可以松口气，开始看看并不这么麻烦的控制器初始化以及控制数据包的格式。
+至此，有关视频流的接收初始化工作就全部完成了。我们可以松口气，开始看看并不这么麻烦的控制器初始化以及控制数据包的格式。 
+
+```c
+bool
+controller_init(struct controller *controller, socket_t control_socket) {
+    cbuf_init(&controller->queue);
+
+    if (!receiver_init(&controller->receiver, control_socket)) {
+        return false;
+    }
+
+    if (!(controller->mutex = SDL_CreateMutex())) {
+        receiver_destroy(&controller->receiver);
+        return false;
+    }
+
+    if (!(controller->msg_cond = SDL_CreateCond())) {
+        receiver_destroy(&controller->receiver);
+        SDL_DestroyMutex(controller->mutex);
+        return false;
+    }
+
+    controller->control_socket = control_socket;
+    controller->stopped = false;
+
+    return true;
+}
+```
+
+```c
+#define cbuf_init(PCBUF) (void) ((PCBUF)->head = (PCBUF)->tail = 0)
+
+(void) ((&controller->queue)->head = (&controller->queue)->tail = 0)
+```
+
+首先执行`controller_init`方法，此方法进入后先初始化了控制器的消息队列，然后执行`receiver_init`方法，这个方法只是给`receiver`创建一些mutex变量，方法返回后继续向下执行，为`controller`创建mutex和消息来临时的condition，比较常规，没有太多特别的。
+
+控制器初始化完成后，开始创建控制器事件处理线程：
+
+```c
+bool
+controller_start(struct controller *controller) {
+    LOGD("Starting controller thread");
+
+    controller->thread = SDL_CreateThread(run_controller, "controller",
+                                          controller);
+    if (!controller->thread) {
+        LOGC("Could not start controller thread");
+        return false;
+    }
+
+    if (!receiver_start(&controller->receiver)) {
+        controller_stop(controller);
+        SDL_WaitThread(controller->thread, NULL);
+        return false;
+    }
+
+    return true;
+}
+```
 
 ### 9. 让SDL开始渲染画面
 
