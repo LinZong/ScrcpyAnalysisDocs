@@ -1252,16 +1252,386 @@ if (!screen_init_rendering(&screen, window_title, frame_size,
 * frame_size：帧大小。代表手机端屏幕视频流所传输的画面的宽高像素大小。
 * rotation：是否旋转。默认是竖屏（1080x1920），旋转过来就是横屏（1920x1080）。
 * window_size：窗体大小，受到`content_size`和`window_width`、`window_height`相关。
+* content_size：内容大小，通过frame_size和rotation状态计算出来的，未经裁剪的显示画面大小。
 
 方法首先看看当前画面是不是要旋转的，如果要旋转的话就把原本的宽高调整一下位置；然后根据content_size和window_size(width and height)和initial window size组合起来考虑，计算出要创建的窗口的window_size，接下来就是设置一堆flags，不断的调用各种SDL的方法，创建窗口、创建渲染器、初始化OpenGL，创建屏幕绘图材质，更新画面，开始持续输出视频流。
 
+计算出成比例的长宽
+
+```c
+// initially, there is no current size, so use the frame size as current size
+// req_width and req_height, if not 0, are the sizes requested by the user
+static inline struct size
+get_initial_optimal_size(struct size content_size, uint16_t req_width,
+                         uint16_t req_height) {
+    struct size window_size;
+    if (!req_width && !req_height) {
+        window_size = get_optimal_size(content_size, content_size);
+    } else {
+        if (req_width) {
+            window_size.width = req_width;
+        } else {
+            // compute from the requested height
+            window_size.width = (uint32_t) req_height * content_size.width
+                              / content_size.height;
+        }
+        if (req_height) {
+            window_size.height = req_height;
+        } else {
+            // compute from the requested width
+            window_size.height = (uint32_t) req_width * content_size.height
+                               / content_size.width;
+        }
+    }
+    return window_size;
+}
+```
+
+```c
+// return the optimal size of the window, with the following constraints:
+//  - it attempts to keep at least one dimension of the current_size (i.e. it
+//    crops the black borders)
+//  - it keeps the aspect ratio
+//  - it scales down to make it fit in the display_size
+// 中文翻译版 Chinese Version
+// 返回窗口的一个优化后的大小，受以下几个条件的约束：
+// - 尝试保持current_size中至少一条边的长度
+// - 保持画面比例
+// - 画面经过伸缩以适应display_size的大小（a.k.a viewport size）
+static struct size
+get_optimal_size(struct size current_size, struct size content_size) {
+    if (content_size.width == 0 || content_size.height == 0) {
+        // avoid division by 0
+        return current_size;
+    }
+
+    struct size window_size;
+
+    struct size display_size;
+    if (!get_preferred_display_bounds(&display_size)) {
+        // could not get display bounds, do not constraint the size
+        window_size.width = current_size.width;
+        window_size.height = current_size.height;
+    } else {
+        window_size.width = MIN(current_size.width, display_size.width);
+        window_size.height = MIN(current_size.height, display_size.height);
+    }
+
+    if (is_optimal_size(window_size, content_size)) {
+        return window_size;
+    }
+
+    bool keep_width = content_size.width * window_size.height
+                    > content_size.height * window_size.width;
+    if (keep_width) {
+        // remove black borders on top and bottom
+        window_size.height = content_size.height * window_size.width
+                           / content_size.width;
+    } else {
+        // remove black borders on left and right (or none at all if it already
+        // fits)
+        window_size.width = content_size.width * window_size.height
+                          / content_size.height;
+    }
+
+    return window_size;
+}
+```
+
+代码首先去获取现在屏幕有多大的可用空间（对于macOS来说，可用空间就是除掉上面的菜单栏和底下的dock的一整行之后剩余的显示空间），然后用屏幕最大可用空前去裁剪请求的current_size。因为不能大过屏幕的可用空间，否则内容就会显示不全了。然后计算被可用空间裁剪过的size是不是和content_size保持纵横比的，如果是就可以直接返回了，否则要重新计算纵横比再返回。详细逻辑看上面代码块的后半段，不难理解。
+
+从计算窗体大小的`get_initial_optimal_size`方法返回后，scrcpy会开始根据一些meson在configure阶段收集的系统信息，例如你现在的系统是不是开启了HiDPIng模式，你是否设置了always on top的标记等等，为待创建的SDL window设置一系列的标志位。然后开始创建窗口：
+
+```c
+screen->window = SDL_CreateWindow(window_title, x, y,
+                                      window_size.width, window_size.height,
+                                      window_flags);
+```
+
+以及创建2D窗体内容渲染上下文
+
+```c
+screen->renderer = SDL_CreateRenderer(screen->window, -1,
+                                          SDL_RENDERER_ACCELERATED);
+```
+
+渲染上下文创建完成后，需要获取SDL采用的渲染器，对于一些比较普遍的渲染器（如OpenGL），需要进行特别的设置。代码读到这里，读者们也不难发现，我们在控制台中经常看到有关当前操作系统采用的渲染器的日志
+
+```shell
+2020-07-30 08:54:07.015 scrcpy[77680:2429283] INFO: scrcpy 1.14 <https://github.com/Genymobile/scrcpy>
+/usr/local/Cellar/scrcpy/1.14_1/share/scrcpy/scrcpy-server: 1 file pushed, 0 skipped. 9.0 MB/s (33142 bytes in 0.004s)
+[server] INFO: Device: Xiaomi MIX 2S (Android 10)
+2020-07-30 08:54:08.091 scrcpy[77680:2429283] INFO: Created renderer: metal
+2020-07-30 08:54:08.091 scrcpy[77680:2429283] INFO: Renderer: metal <- 看这个
+2020-07-30 08:54:08.093 scrcpy[77680:2429283] INFO: Initial texture: 1080x2160
+```
+
+其实就是这一句
+
+```c
+LOGI("Renderer: %s", renderer_name ? renderer_name : "(unknown)");
+```
+
+输出的。
+
+接下来是解析xpm格式的图标，scrcpy的团队发现使用SDL库的`SDL2_image`方法读取图片在MSYS2编译的Windows环境下有问题，因此他们团队不得已造了个轮子，不依赖SDL的方法来解析图像了。由于笔者对xpm格式的定义实在是没什么兴趣，因此解析icon文件的代码就略过了，有兴趣的读者可以自行深入学度`read_xpm()`方法，相信一定会有收获。
+
+随后是创建有关于当前屏幕的2D渲染材质。又因为安卓屏幕录制视频流的编码是YV12，所以这里创建的2D渲染材质设置了像素格式为`SDL_PIXELFORMAT_YV12`，数据访问来源是`SDL_TEXTUREACCESS_STREAMING`（在网络流中获得的材质像素数据）。
+
 ### 10. 控制器发出预设指令（如有）
+
+如果scrcpy的启动参数中需要把屏幕关掉，那么当代码执行到这一步后，会构造一个类型为`CONTROL_MSG_TYPE_SET_SCREEN_POWER_MODE`，结果是让手机关闭屏幕的消息给server。方法调用后其实是会原子性地给controller的事件队列插入一个新的，关闭屏幕的消息，等待下一个事件循环后controller就会把这个消息序列化发出去给server，server处理后通知系统关闭屏幕。
 
 ### 11. 进入全屏模式（如果需要）
 
+如果scrcpy的启动参数中需要把scrcpy设全屏，那么代码执行到这一步之后，就会进行最大化的操作。看了源码发现设为全屏后需要立即调用`screen_render`刷新屏幕方向变化后的画面。具体细节可以看源码，这部分代码比较简单。
+
 ### 12. 进入事件循环
+
+主线程中进行的事件循环主要有两个作用：1. 对窗口的最大最小化渲染做处理：
+
+```c
+
+#ifdef CONTINUOUS_RESIZING_WORKAROUND
+// On Windows and MacOS, resizing blocks the event loop, so resizing events are
+// not triggered. As a workaround, handle them in an event handler.
+//
+// <https://bugzilla.libsdl.org/show_bug.cgi?id=2077>
+// <https://stackoverflow.com/a/40693139/1987178>
+static int
+event_watcher(void *data, SDL_Event *event) {
+    (void) data;
+    if (event->type == SDL_WINDOWEVENT
+            && event->window.event == SDL_WINDOWEVENT_RESIZED) {
+        // In practice, it seems to always be called from the same thread in
+        // that specific case. Anyway, it's just a workaround.
+        screen_render(&screen, true);
+    }
+    return 0;
+}
+#endif
+```
+
+另外就是处理真正的用户操作scrcpy窗口而发生的事件：
+
+```c
+static enum event_result
+handle_event(SDL_Event *event, bool control) {
+    switch (event->type) {
+        case EVENT_STREAM_STOPPED:
+            LOGD("Video stream stopped");
+            return EVENT_RESULT_STOPPED_BY_EOS;
+        case SDL_QUIT:
+            LOGD("User requested to quit");
+            return EVENT_RESULT_STOPPED_BY_USER;
+        case EVENT_NEW_FRAME:
+            if (!screen.has_frame) {
+                screen.has_frame = true;
+                // this is the very first frame, show the window
+                screen_show_window(&screen);
+            }
+            if (!screen_update_frame(&screen, &video_buffer)) {
+                return EVENT_RESULT_CONTINUE;
+            }
+            break;
+        case SDL_WINDOWEVENT:
+            screen_handle_window_event(&screen, &event->window);
+            break;
+        case SDL_TEXTINPUT:
+            if (!control) {
+                break;
+            }
+            input_manager_process_text_input(&input_manager, &event->text);
+            break;
+        case SDL_KEYDOWN:
+        case SDL_KEYUP:
+            // some key events do not interact with the device, so process the
+            // event even if control is disabled
+            input_manager_process_key(&input_manager, &event->key, control);
+            break;
+        case SDL_MOUSEMOTION:
+            if (!control) {
+                break;
+            }
+            input_manager_process_mouse_motion(&input_manager, &event->motion);
+            break;
+        case SDL_MOUSEWHEEL:
+            if (!control) {
+                break;
+            }
+            input_manager_process_mouse_wheel(&input_manager, &event->wheel);
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP:
+            // some mouse events do not interact with the device, so process
+            // the event even if control is disabled
+            input_manager_process_mouse_button(&input_manager, &event->button,
+                                               control);
+            break;
+        case SDL_FINGERMOTION:
+        case SDL_FINGERDOWN:
+        case SDL_FINGERUP:
+            input_manager_process_touch(&input_manager, &event->tfinger);
+            break;
+        case SDL_DROPFILE: {
+            if (!control) {
+                break;
+            }
+            file_handler_action_t action;
+            if (is_apk(event->drop.file)) {
+                action = ACTION_INSTALL_APK;
+            } else {
+                action = ACTION_PUSH_FILE;
+            }
+            file_handler_request(&file_handler, action, event->drop.file);
+            break;
+        }
+    }
+    return EVENT_RESULT_CONTINUE;
+}
+
+```
 
 ### 13. 应用退出前收尾
 
+最后应用退出前的收尾其实没啥可圈可点的地方。先关注应用的主线程如何从事件循环中退出：
 
+```c
+static bool
+event_loop(bool display, bool control) {
+    (void) display;
+#ifdef CONTINUOUS_RESIZING_WORKAROUND
+    if (display) {
+        SDL_AddEventWatch(event_watcher, NULL);
+    }
+#endif
+    SDL_Event event;
+    while (SDL_WaitEvent(&event)) {
+        enum event_result result = handle_event(&event, control);
+        switch (result) {
+            case EVENT_RESULT_STOPPED_BY_USER:
+                return true;
+            case EVENT_RESULT_STOPPED_BY_EOS:
+                LOGW("Device disconnected");
+                return false;
+            case EVENT_RESULT_CONTINUE:
+                break;
+        }
+    }
+    return false;
+}
+```
+
+当`SDL_WaitEvent`为false，或者是`handle_event`方法返回了`EVENT_RESULT_STOPPED_BY_USER`，`EVENT_RESULT_STOPPED_BY_USER`的话，就会从事件循环中退出，走到最后的资源销毁逻辑。就是下面这一段和创建的时候对等的逻辑。
+
+```c
+    screen_destroy(&screen);
+
+end:
+    // stop stream and controller so that they don't continue once their socket
+    // is shutdown
+    if (stream_started) {
+        stream_stop(&stream);
+    }
+    if (controller_started) {
+        controller_stop(&controller);
+    }
+    if (file_handler_initialized) {
+        file_handler_stop(&file_handler);
+    }
+    if (fps_counter_initialized) {
+        fps_counter_interrupt(&fps_counter);
+    }
+
+    // shutdown the sockets and kill the server
+    server_stop(&server);
+
+    // now that the sockets are shutdown, the stream and controller are
+    // interrupted, we can join them
+    if (stream_started) {
+        stream_join(&stream);
+    }
+    if (controller_started) {
+        controller_join(&controller);
+    }
+    if (controller_initialized) {
+        controller_destroy(&controller);
+    }
+
+    if (recorder_initialized) {
+        recorder_destroy(&recorder);
+    }
+
+    if (file_handler_initialized) {
+        file_handler_join(&file_handler);
+        file_handler_destroy(&file_handler);
+    }
+
+    if (video_buffer_initialized) {
+        video_buffer_destroy(&video_buffer);
+    }
+
+    if (fps_counter_initialized) {
+        fps_counter_join(&fps_counter);
+        fps_counter_destroy(&fps_counter);
+    }
+
+    server_destroy(&server);
+
+    return ret;
+}
+```
+
+这段代码中，读者点进去看的话其实大同小异，基本上都是等待mutex和condition完成，然后回收资源，结束任务。过程是相对的，只要前面创建的代码理解了，后面退出的代码也不难看懂。目前重点关注的是如何结束网络socket连接，优雅退出，可以查看以下令server退出的代码：
+
+```c
+void
+server_stop(struct server *server) {
+    if (server->server_socket != INVALID_SOCKET
+            && !atomic_flag_test_and_set(&server->server_socket_closed)) {
+        close_socket(server->server_socket);
+    }
+    if (server->video_socket != INVALID_SOCKET) {
+        close_socket(server->video_socket);
+    }
+    if (server->control_socket != INVALID_SOCKET) {
+        close_socket(server->control_socket);
+    }
+
+    assert(server->process != PROCESS_NONE);
+
+    cmd_terminate(server->process);
+
+    if (server->tunnel_enabled) {
+        // ignore failure
+        disable_tunnel(server);
+    }
+
+    SDL_WaitThread(server->wait_server_thread, NULL);
+}
+```
+
+把没杀掉的welcome socket杀掉，然后是video socket和control socket。最后把维持着server启动的adb shell命令也给kill掉，adb reverse(或者是adb forward) 隧道关掉。最后等待那个守护welcome socket的进程退出，`server_stop`方法的任务也宣告结束了。本质上这就是一个网络应用和实时编解码应用。因此搞定网络连接的优雅断开以及编解码资源、绘图资源的优雅回收是显得非常重要的。video buffer（包含decoding buffer和rendering buffer）就是这样清除的
+
+```c
+void
+video_buffer_destroy(struct video_buffer *vb) {
+    if (vb->render_expired_frames) {
+        SDL_DestroyCond(vb->rendering_frame_consumed_cond);
+    }
+    SDL_DestroyMutex(vb->mutex);
+    av_frame_free(&vb->rendering_frame);
+    av_frame_free(&vb->decoding_frame);
+}
+```
+
+## 写在最后
+
+感谢所有坚持阅读到这里的读者，我们的源码阅读之旅到目前为止就接近尾声了。相信通过阅读以上的源码，大家也对scrcpy的client侧工作原理有了一个初步的认识。虽然，在很多人的印象中，scrcpy本质上只是一个把手机屏幕显示到电脑上，方便我们在电脑上操作安卓手机的小程序。咋一听上去并不是很难，并且也肯定有不少安卓同行们脑海里就已经勾勒出这类工具软件的项目文件结构、采用的技术点等轮廓了。
+
+但是为了做到尽善尽美，做到操作低延迟，画面高质量，方便易用（鼠标点击模拟操作，拖拽传文件，大量的启动参数可供配置，C语言程序也做到跨平台），我们可以从源码中看到开发软件的团队做出了非常多的努力，代码文件组织得井井有条，平台相关代码的细节处理也非常到位，甚至在描述视频流的数据包时，还在注释中画了一个数据包结构的字符画；这是一个开源软件十分难能可贵的品质。
+
+在写下这篇笔记之前，笔者其实已经使用scrcpy很长一段时间了。因为笔者业余会进行一些安卓小程序的开发，每次为了调试功能，都需要把手从鼠标键盘上移开，拿起桌面上的手机一通点点点，然后又要按起键盘鼠标继续操作，笔者个人感觉这样的调试方式对于工作流的割裂感非常严重；并且笔者听一些在字节跳动工作的朋友说，字节的安卓开发调试机是不需要你去拿到真机的，反而是登陆内部的一个测试机管理平台，提交申请后就能够在类似于网页的地方，以scrcpy的形式操作放在远程的测试机。这样一来，公司既省去了发放、保管测试机的麻烦，也可以避免测试机给到员工手里之后产生的耗损，甚至服务器端统一管理这些测试机，管理平台也能随时随地监控测试机上运行的应用状态，偶尔也会给安卓开发的同学一些性能优化的建议。笔者一度十分好奇字节跳动究竟是怎么做好这一套测试机管理申请发放系统的；而目前来说笔者能接触到的、和字节测试机管理平台最像的软件就只是scrcpy了。因此，笔者强烈的好奇心也是这篇笔记能够完成的一个动力吧。
+
+再次感谢读者们的阅读，希望这篇并不怎么规范的笔记能给您带来帮助，也希望能够给安卓开发同行们带来灵感。
 
