@@ -1043,8 +1043,217 @@ controller_start(struct controller *controller) {
     return true;
 }
 ```
+```c
+static int
+run_controller(void *data) {
+    struct controller *controller = data;
+
+    for (;;) {
+        mutex_lock(controller->mutex);
+        while (!controller->stopped && cbuf_is_empty(&controller->queue)) {
+            cond_wait(controller->msg_cond, controller->mutex);
+        }
+        if (controller->stopped) {
+            // stop immediately, do not process further msgs
+            mutex_unlock(controller->mutex);
+            break;
+        }
+        struct control_msg msg;
+        bool non_empty = cbuf_take(&controller->queue, &msg);
+        assert(non_empty);
+        (void) non_empty;
+        mutex_unlock(controller->mutex);
+
+        bool ok = process_msg(controller, &msg);
+        control_msg_destroy(&msg);
+        if (!ok) {
+            LOGD("Could not write msg to socket");
+            break;
+        }
+    }
+    return 0;
+}
+```
+
+这又是一个非常标准且枯燥的事件循环，没有太多可圈可点的地方。不过倒是可以花点时间看看控制消息的结构体定义：
+
+```c
+struct control_msg {
+    enum control_msg_type type;
+    union {
+        struct {
+            enum android_keyevent_action action;
+            enum android_keycode keycode;
+            enum android_metastate metastate;
+        } inject_keycode;
+        struct {
+            char *text; // owned, to be freed by SDL_free()
+        } inject_text;
+        struct {
+            enum android_motionevent_action action;
+            enum android_motionevent_buttons buttons;
+            uint64_t pointer_id;
+            struct position position;
+            float pressure;
+        } inject_touch_event;
+        struct {
+            struct position position;
+            int32_t hscroll;
+            int32_t vscroll;
+        } inject_scroll_event;
+        struct {
+            char *text; // owned, to be freed by SDL_free()
+            bool paste;
+        } set_clipboard;
+        struct {
+            enum screen_power_mode mode;
+        } set_screen_power_mode;
+    };
+};
+```
+
+这个结构体也很清晰明了，接下来看看控制消息序列化的具体方法，看看控制消息结构是如何序列化成网络上传输的数据包的：
+
+```c
+size_t
+control_msg_serialize(const struct control_msg *msg, unsigned char *buf) {
+    buf[0] = msg->type;
+    switch (msg->type) {
+        case CONTROL_MSG_TYPE_INJECT_KEYCODE:
+            buf[1] = msg->inject_keycode.action;
+            buffer_write32be(&buf[2], msg->inject_keycode.keycode);
+            buffer_write32be(&buf[6], msg->inject_keycode.metastate);
+            return 10;
+        case CONTROL_MSG_TYPE_INJECT_TEXT: {
+            size_t len =
+                write_string(msg->inject_text.text,
+                             CONTROL_MSG_INJECT_TEXT_MAX_LENGTH, &buf[1]);
+            return 1 + len;
+        }
+        case CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT:
+            buf[1] = msg->inject_touch_event.action;
+            buffer_write64be(&buf[2], msg->inject_touch_event.pointer_id);
+            write_position(&buf[10], &msg->inject_touch_event.position);
+            uint16_t pressure =
+                to_fixed_point_16(msg->inject_touch_event.pressure);
+            buffer_write16be(&buf[22], pressure);
+            buffer_write32be(&buf[24], msg->inject_touch_event.buttons);
+            return 28;
+        case CONTROL_MSG_TYPE_INJECT_SCROLL_EVENT:
+            write_position(&buf[1], &msg->inject_scroll_event.position);
+            buffer_write32be(&buf[13],
+                             (uint32_t) msg->inject_scroll_event.hscroll);
+            buffer_write32be(&buf[17],
+                             (uint32_t) msg->inject_scroll_event.vscroll);
+            return 21;
+        case CONTROL_MSG_TYPE_SET_CLIPBOARD: {
+            buf[1] = !!msg->set_clipboard.paste;
+            size_t len = write_string(msg->set_clipboard.text,
+                                      CONTROL_MSG_CLIPBOARD_TEXT_MAX_LENGTH,
+                                      &buf[2]);
+            return 2 + len;
+        }
+        case CONTROL_MSG_TYPE_SET_SCREEN_POWER_MODE:
+            buf[1] = msg->set_screen_power_mode.mode;
+            return 2;
+        case CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON:
+        case CONTROL_MSG_TYPE_EXPAND_NOTIFICATION_PANEL:
+        case CONTROL_MSG_TYPE_COLLAPSE_NOTIFICATION_PANEL:
+        case CONTROL_MSG_TYPE_GET_CLIPBOARD:
+        case CONTROL_MSG_TYPE_ROTATE_DEVICE:
+            // no additional data
+            return 1;
+        default:
+            LOGW("Unknown message type: %u", (unsigned) msg->type);
+            return 0;
+    }
+}
+```
+
+控制消息最大长度为4096字节，定义在宏`CONTROL_MSG_SERIALIZED_MAX_SIZE`中。消息体的第一个字节存储消息类型。目前scrcpy client支持传送以下几种消息类型：
+
+* 键盘输入事件（把client的键盘输入转发到手机server）
+* 文本事件（inject the text as input events）
+* 触摸事件（client窗口点击转发到手机的触摸事件）
+* 滚动事件
+* 剪贴板事件（store the text in the device clipboard and paste）
+* 屏幕开关事件（点亮屏幕或关闭屏幕）
+* 返回或者点亮屏幕事件
+* 下拉任务栏
+* 收起任务栏
+* 获取设备的剪贴板（就是把server的剪贴板同步到本地）
+* 旋转设备
+
+除了文本消息和剪贴板消息可能是变长消息体外，其他的消息都是定长的。因此先重点关注一下变长消息体的结构，以`CONTROL_MSG_TYPE_INJECT_TEXT`为案例分析。点进`write_string`方法，首先进行的是`utf8_truncation_index`。因为inject text的文本最大长度限制是300，当传入待inject的文本超过指定长度时，需要进行截断。而文本是使用UTF8进行编码的，UTF8在表达多字节字符集的时候有前导比特位告知当前表达的字符需要占用多少个字节。
+
+> UTF8单字节符（可用比特位以x来表示）:
+>
+> 0xxx xxxx
+>
+> 表示范围：0000 0000 -> 0111 1111
+>
+> UTF8 双字节符号
+>
+> 110x xxxx 10xx xxxx
+>
+> 表示范围: 1100 0010 1000 0000 -> 1101 1111 1011 1111
+>
+> UTF8 三字节符号
+>
+> 1110 xxxx 10xx xxxx 10xx xxxx
+>
+> UTF8 四字节符号
+>
+> 1111 0xxx 10xx xxxx 10xx xxxx 10xx xxxx
+>
+> 后面两个多字节符号的UTF-8表示范围自己推导。笔者实在是懒得推导了。
+
+> 另外，笔者在阅读这一段代码的时候搞不明白，为什么最长消息体是4095 (Buffer长度是4096字节，刨去一个存消息类型的字节)的情况下，inject text的最大文本长度限制是300。猜想可能和安卓的某些剪贴板机制有关，待查。
+
+Therefore, this method should verify whether the last byte of truncated buffer is a new UTF-8 codepoint mark byte (begin with 1100 0000) or not. If we cut the byte followed by the UTF-8 codepoint mark byte, the message cannot parse correctly. So the method should verify every bytes truncated end-to-front, ensure that no more broken UTF-8 codepoint in the end of sending buffer.
+
+因此，这个方法要检查准备截断的消息体的最后一个字节是不是一个新的UTF-8多字节码点前导标记字节(以1100 0000开头)。因为如果截断的是UTF-8多字节码点前导标记以后的字节，那么消息体将不能被正确的解析。所以，方法必须从后往前检查发送缓冲中截断后的字节，把截断后可能残余的UTF-8码点字节都一并截掉。
+
+> 限于笔者低下的表达能力，笔者觉得这段描述UTF-8编码格式的文字用中文写实在是费劲，因此写了一段英文的版本，如果读者在阅读中文版本的时候感觉到困惑，不妨阅读英文版本以及有关UTF-8 encoding format的文档 [UTF-8 编码格式 from wikipedia](https://en.wikipedia.org/wiki/UTF-8#Description)。
+
+完成消息体字节的截断后，方法返回截断完成后发送字节的长度。接下来，把截断后的文本复制到消息体中，对消息体完成序列化，准备把消息体发送出去。从宏观上看，实现如下代码：
+
+```c
+static bool
+process_msg(struct controller *controller,
+              const struct control_msg *msg) {
+    unsigned char serialized_msg[CONTROL_MSG_SERIALIZED_MAX_SIZE];
+    int length = control_msg_serialize(msg, serialized_msg);
+    if (!length) {
+        return false;
+    }
+    int w = net_send_all(controller->control_socket, serialized_msg, length);
+    return w == length;
+}
+```
 
 ### 9. 让SDL开始渲染画面
+
+接下来，scrcpy会将一大堆参数传给`screen_init_rendering`方法，开始创建窗口，及绘制手机画面。对于scrcpy而言，上面介绍的控制器、剪贴板、UTF-8编码，从严格意义上来说只能算是锦上添花；而高效地解析视频流，并把画面显示在电脑屏幕上，才是scrcpy这个软件小而美的精髓。我们将开始关注画面的渲染是如何初始化的：
+
+```c
+if (!screen_init_rendering(&screen, window_title, frame_size,
+                                   options->always_on_top, options->window_x,
+                                   options->window_y, options->window_width,
+                                   options->window_height,
+                                   options->window_borderless,
+                                   options->rotation, options-> mipmaps)) {
+            goto end;
+}
+```
+
+在开始阅读`screen_init_recording`方法之前，先了解几个简单的概念:
+
+* frame_size：帧大小。代表手机端屏幕视频流所传输的画面的宽高像素大小。
+* rotation：是否旋转。默认是竖屏（1080x1920），旋转过来就是横屏（1920x1080）。
+* window_size：窗体大小，受到`content_size`和`window_width`、`window_height`相关。
+
+方法首先看看当前画面是不是要旋转的，如果要旋转的话就把原本的宽高调整一下位置；然后根据content_size和window_size(width and height)和initial window size组合起来考虑，计算出要创建的窗口的window_size，接下来就是设置一堆flags，不断的调用各种SDL的方法，创建窗口、创建渲染器、初始化OpenGL，创建屏幕绘图材质，更新画面，开始持续输出视频流。
 
 ### 10. 控制器发出预设指令（如有）
 
